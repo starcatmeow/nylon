@@ -11,21 +11,21 @@ New-Item -ItemType Directory -Force $diagnosticsDir | Out-Null
 function Save-Diagnostics([string]$Phase) {
     # Missing services/logs are diagnostic evidence, not a reason to lose the probe result.
     $report = Join-Path $diagnosticsDir "system-$Phase.txt"
-    "Captured at $([DateTime]::UtcNow.ToString('o'))" | Set-Content $report
+    "Captured at $([DateTime]::UtcNow.ToString('o'))" | Set-Content $report -Encoding UTF8
     foreach ($service in @('PlugPlay', 'DeviceInstall', 'DsmSvc', 'RpcSs', 'wintun')) {
         foreach ($operation in @('query', 'qc')) {
-            "`n> sc.exe $operation $service" | Add-Content $report
-            & sc.exe $operation $service 2>&1 | Out-File $report -Append
-            "Exit code: $LASTEXITCODE" | Add-Content $report
+            "`n> sc.exe $operation $service" | Add-Content $report -Encoding UTF8
+            & sc.exe $operation $service 2>&1 | Out-File $report -Append -Encoding UTF8
+            "Exit code: $LASTEXITCODE" | Add-Content $report -Encoding UTF8
         }
     }
-    & whoami.exe /all 2>&1 | Out-File $report -Append
+    & whoami.exe /all 2>&1 | Out-File $report -Append -Encoding UTF8
     foreach ($log in @('setupapi.dev.log', 'setupapi.app.log')) {
         $source = Join-Path $env:windir "INF\$log"
         try {
             Copy-Item -LiteralPath $source -Destination (Join-Path $diagnosticsDir "$Phase-$log")
         } catch {
-            "Could not copy ${source}: $_" | Add-Content $report
+            "Could not copy ${source}: $_" | Add-Content $report -Encoding UTF8
         }
     }
 }
