@@ -1,0 +1,81 @@
+name: Wintun Windows probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/wintun-windows.yml
+      - .github/scripts/Test-Wintun.ps1
+  pull_request:
+    paths:
+      - .github/workflows/wintun-windows.yml
+      - .github/scripts/Test-Wintun.ps1
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Wintun (${{ matrix.environment }})
+    runs-on: windows-2022
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [host, container]
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Wintun 0.14.1
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force probe, results | Out-Null
+          Invoke-WebRequest -UseBasicParsing https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile probe/wintun.zip
+          Expand-Archive probe/wintun.zip probe/unpacked
+          Copy-Item probe/unpacked/wintun/bin/amd64/wintun.dll probe/wintun.dll
+          $signature = Get-AuthenticodeSignature probe/wintun.dll
+          $signature | Format-List Status, StatusMessage, SignerCertificate
+          if ($signature.Status -ne 'Valid') { throw 'Wintun DLL signature is invalid' }
+          Get-FileHash probe/wintun.dll -Algorithm SHA256
+          Copy-Item .github/scripts/Test-Wintun.ps1 probe/Test-Wintun.ps1
+      - name: Probe directly on hosted Windows VM
+        if: matrix.environment == 'host'
+        run: ./probe/Test-Wintun.ps1 -DllPath ./probe/wintun.dll -ResultPath ./results/result.json
+      - name: Probe inside Windows container
+        if: matrix.environment == 'container'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          docker version
+          if ($LASTEXITCODE -ne 0) { throw 'Docker daemon is unavailable' }
+          $os = docker info --format '{{.OSType}}'
+          if ($LASTEXITCODE -ne 0 -or $os -ne 'windows') { throw 'A Windows Docker daemon is required' }
+          $image = 'mcr.microsoft.com/windows/servercore:ltsc2022'
+          docker pull $image
+          if ($LASTEXITCODE -ne 0) { throw 'Windows container image pull failed' }
+          docker image inspect $image --format '{{json .RepoDigests}}'
+          # Windows Actions job containers are unsupported; launch Docker explicitly.
+          docker run --rm --isolation=process --user ContainerAdministrator `
+            --mount "type=bind,source=$($env:GITHUB_WORKSPACE)\probe,target=C:\probe,readonly" `
+            --mount "type=bind,source=$($env:GITHUB_WORKSPACE)\results,target=C:\results" `
+            $image powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            -File C:\probe\Test-Wintun.ps1 -DllPath C:\probe\wintun.dll -ResultPath C:\results\result.json
+          if ($LASTEXITCODE -ne 0) { throw "Wintun container probe failed (exit $LASTEXITCODE)" }
+      - name: Publish probe summary
+        if: always()
+        run: |
+          '### Wintun: ${{ matrix.environment }}' | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          if (Test-Path results/result.json) {
+            '```json' | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            Get-Content results/result.json | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            '```' | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          } else {
+            'No probe result was produced. Check setup/container logs; this is not a DLL-load result.' | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wintun-${{ matrix.environment }}
+          path: results/
+          if-no-files-found: warn

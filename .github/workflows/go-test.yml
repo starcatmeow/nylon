@@ -1,16 +1,8 @@
 name: Go Test
 
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - "docs/**"
-      - "README.md"
-  pull_request:
-    branches: [main]
-    paths-ignore:
-      - "docs/**"
-      - "README.md"
+  # Automatic CI is paused while the Windows Wintun probe is evaluated.
+  workflow_dispatch:
 
 permissions:
   contents: read
