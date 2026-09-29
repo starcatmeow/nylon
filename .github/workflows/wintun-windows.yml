@@ -73,6 +73,7 @@ jobs:
           } else {
             'No probe result was produced. Check setup/container logs; this is not a DLL-load result.' | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           }
+          'Download the wintun-${{ matrix.environment }} artifact for Wintun internal logs, service configuration/status, token privileges, and before/after SetupAPI logs. Missing services or logs are recorded in system-*.txt.' | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
       - uses: actions/upload-artifact@v4
         if: always()
         with:

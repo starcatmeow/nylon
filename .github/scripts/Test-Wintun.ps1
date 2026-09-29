@@ -4,6 +4,33 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$ResultPath = [IO.Path]::GetFullPath($ResultPath)
+$diagnosticsDir = Split-Path -Parent $ResultPath
+New-Item -ItemType Directory -Force $diagnosticsDir | Out-Null
+
+function Save-Diagnostics([string]$Phase) {
+    # Missing services/logs are diagnostic evidence, not a reason to lose the probe result.
+    $report = Join-Path $diagnosticsDir "system-$Phase.txt"
+    "Captured at $([DateTime]::UtcNow.ToString('o'))" | Set-Content $report
+    foreach ($service in @('PlugPlay', 'DeviceInstall', 'DsmSvc', 'RpcSs', 'wintun')) {
+        foreach ($operation in @('query', 'qc')) {
+            "`n> sc.exe $operation $service" | Add-Content $report
+            & sc.exe $operation $service 2>&1 | Out-File $report -Append
+            "Exit code: $LASTEXITCODE" | Add-Content $report
+        }
+    }
+    & whoami.exe /all 2>&1 | Out-File $report -Append
+    foreach ($log in @('setupapi.dev.log', 'setupapi.app.log')) {
+        $source = Join-Path $env:windir "INF\$log"
+        try {
+            Copy-Item -LiteralPath $source -Destination (Join-Path $diagnosticsDir "$Phase-$log")
+        } catch {
+            "Could not copy ${source}: $_" | Add-Content $report
+        }
+    }
+}
+
+try { Save-Diagnostics 'before' } catch { Write-Warning "Pre-probe diagnostics: $_" }
 $result = [ordered]@{
     os = [Environment]::OSVersion.VersionString
     process64Bit = [Environment]::Is64BitProcess
@@ -19,14 +46,45 @@ $library = [IntPtr]::Zero
 $adapter = [IntPtr]::Zero
 $session = [IntPtr]::Zero
 $stage = 'setup'
+$loggerEnabled = $false
 
 try {
     if (-not [Environment]::Is64BitProcess) { throw 'The amd64 DLL requires a 64-bit process' }
     Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
+using System.IO;
 using System.Runtime.InteropServices;
 public static class WintunProbe {
+    // Wintun can call its logger from native worker threads without a PowerShell runspace.
+    [UnmanagedFunctionPointer(CallingConvention.Winapi, CharSet = CharSet.Unicode)]
+    public delegate void LoggerCallback(int level, ulong timestamp, string message);
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    public delegate void SetLogger(LoggerCallback callback);
+    private static readonly object LogLock = new object();
+    private static readonly LoggerCallback Callback = Log;
+    private static StreamWriter LogFile;
+    public static void EnableLogger(SetLogger setter, string path) {
+        LogFile = new StreamWriter(path, false, System.Text.Encoding.UTF8);
+        LogFile.AutoFlush = true;
+        setter(Callback); // Keep the delegate rooted for the lifetime of native callbacks.
+    }
+    private static void Log(int level, ulong timestamp, string message) {
+        // Never allow a managed exception to cross the native callback boundary.
+        try {
+            lock (LogLock) {
+                if (LogFile != null)
+                    LogFile.WriteLine("{0:o} level={1} {2}", DateTime.FromFileTimeUtc((long)timestamp), level, message);
+            }
+        } catch { }
+    }
+    public static void DisableLogger(SetLogger setter) {
+        setter(null);
+        lock (LogLock) {
+            if (LogFile != null) LogFile.Dispose();
+            LogFile = null;
+        }
+    }
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern IntPtr LoadLibraryExW(string name, IntPtr file, uint flags);
     [DllImport("kernel32.dll", CharSet = CharSet.Ansi, ExactSpelling = true, SetLastError = true)]
@@ -61,6 +119,9 @@ public static class WintunProbe {
     Write-Host 'PASS: LoadLibraryExW(wintun.dll)'
 
     $stage = 'resolveExports'
+    $setLogger = [WintunProbe]::Export($library, 'WintunSetLogger', [WintunProbe+SetLogger])
+    [WintunProbe]::EnableLogger($setLogger, (Join-Path $diagnosticsDir 'wintun.log'))
+    $loggerEnabled = $true
     $create = [WintunProbe]::Export($library, 'WintunCreateAdapter', [WintunProbe+CreateAdapter])
     $close = [WintunProbe]::Export($library, 'WintunCloseAdapter', [WintunProbe+CloseAdapter])
     $version = [WintunProbe]::Export($library, 'WintunGetRunningDriverVersion', [WintunProbe+GetRunningDriverVersion])
@@ -93,15 +154,27 @@ public static class WintunProbe {
     $result.error = $exception.Message
     if ($exception -is [ComponentModel.Win32Exception]) {
         $result.errorCode = $exception.NativeErrorCode
+        $result.errorHex = '0x{0:X8}' -f [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$exception.NativeErrorCode), 0)
+        $result.errorDescription = [ComponentModel.Win32Exception]::new($exception.NativeErrorCode).Message
     }
     Write-Host "FAIL at ${stage}: $($result.error)"
 } finally {
-    if ($session -ne [IntPtr]::Zero) { $end.Invoke($session) }
-    if ($adapter -ne [IntPtr]::Zero) { $close.Invoke($adapter) }
-    if ($library -ne [IntPtr]::Zero) { [void][WintunProbe]::FreeLibrary($library) }
+    try {
+        if ($session -ne [IntPtr]::Zero) { $end.Invoke($session) }
+        if ($adapter -ne [IntPtr]::Zero) { $close.Invoke($adapter) }
+    } catch { $result.cleanupError = "$_" }
+    try {
+        if ($loggerEnabled) { [WintunProbe]::DisableLogger($setLogger) }
+        if ($library -ne [IntPtr]::Zero) { [void][WintunProbe]::FreeLibrary($library) }
+    } catch { $result.loggerCleanupError = "$_" }
     $json = $result | ConvertTo-Json
     $json | Set-Content -LiteralPath $ResultPath -Encoding UTF8
     Write-Host $json
+    try { Save-Diagnostics 'after' } catch { Write-Warning "Post-probe diagnostics: $_" }
+    if (Test-Path (Join-Path $diagnosticsDir 'wintun.log')) {
+        Write-Host '--- Wintun internal log ---'
+        Get-Content (Join-Path $diagnosticsDir 'wintun.log') | ForEach-Object { Write-Host $_ }
+    }
 }
 
 if ($result.failedStage) { exit 1 }
